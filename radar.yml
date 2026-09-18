@@ -1,0 +1,85 @@
+name: BTC 情报雷达
+
+on:
+  schedule:
+    # 每 5 分钟检查一次。GitHub 在整点等高峰时段可能延迟 5-20 分钟, 属正常现象。
+    - cron: "*/5 * * * *"
+  # 允许在网页上手动点按钮运行(第一次测试用这个)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式: normal = 正常抓取, test = 只发一条测试推送"
+        required: true
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - test
+
+# 需要写权限, 才能把去重记录 state.json 提交回仓库
+permissions:
+  contents: write
+
+# 同一时刻只跑一个, 避免两个任务抢着改 state.json
+concurrency:
+  group: btc-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行雷达
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          if [ "$MODE" = "test" ]; then
+            echo ">>> 测试模式"
+            python radar.py --test
+          else
+            echo ">>> 正常模式"
+            python radar.py
+          fi
+
+      # 把"已经推过哪些消息"记回仓库, 否则每次运行都会重复推送同样的内容。
+      # 这一步产生的自动提交是正常的, 不用管它。
+      - name: 保存去重记录
+        run: |
+          git config user.name  "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add state.json
+
+          if git diff --staged --quiet; then
+            echo "状态无变化, 无需提交"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新雷达状态 [skip ci]"
+
+          for i in 1 2 3; do
+            if git push origin HEAD:${GITHUB_REF_NAME}; then
+              echo "状态已保存"
+              exit 0
+            fi
+            echo "推送冲突, 合并远端后重试 ($i/3)"
+            git fetch origin ${GITHUB_REF_NAME}
+            git merge -s ours --no-edit FETCH_HEAD || true
+          done
+
+          echo "警告: 状态保存失败, 可能导致下轮重复推送"
+          exit 1

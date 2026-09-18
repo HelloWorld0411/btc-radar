@@ -1,0 +1,456 @@
+# ===========================================================================
+# 比特币情报雷达 · 配置文件
+# ---------------------------------------------------------------------------
+# 你以后想调整雷达的"灵敏度", 只需要改这一个文件, 不用碰 radar.py。
+# 改完保存, 下一轮 GitHub Actions 跑的时候就会生效。
+#
+# 最常用的三个旋钮, 在文件最下面的 scoring 里:
+#   threshold              —— 推送门槛。调高 = 推得更少更精准, 调低 = 推得更多
+#   max_items_per_push     —— 一条推送里最多塞几条消息
+#   max_pushes_per_day     —— 每天最多推几条(超过就不再推了)
+# ===========================================================================
+
+push:
+  # 消息模板。markdown 在微信里显示最清楚, 不建议改。
+  template: "markdown"
+  # 每天最多推送几条消息。同一轮抓到的多条会打包成一条, 所以这个数字
+  # 约等于"每天最多响几次手机"。嫌吵就调到 3 或 4。
+  max_pushes_per_day: 6
+  # 单次推送里最多包含几条情报
+  max_items_per_push: 4
+  # 如果你想推给多个人, 先在 pushplus 网站建一个"普通群组", 把群组编码填这里
+  topic: ""
+
+
+sources:
+
+  # -------------------------------------------------------------------------
+  # 一、新闻电报(RSS 订阅源)。weight = 这个源的可信度权重, 直接加到分数上。
+  # -------------------------------------------------------------------------
+  feeds:
+    # 路透社: 用新闻站点地图, 更新最快(通常 1 分钟内), 但只有标题没有正文
+    - name: "路透社"
+      url: "https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml"
+      weight: 3
+      enabled: true
+
+    # 卫报国际版: 更新快, 有摘要
+    - name: "卫报"
+      url: "https://www.theguardian.com/world/rss"
+      weight: 2
+      enabled: true
+
+    # 半岛电视台: 中东消息最灵通, 特朗普-伊朗这类题材它最快
+    - name: "半岛电视台"
+      url: "https://www.aljazeera.com/xml/rss/all.xml"
+      weight: 2
+      enabled: true
+
+    - name: "BBC"
+      url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+      weight: 2
+      enabled: true
+
+    # ---- 币圈媒体 ----
+    - name: "CoinDesk"
+      url: "https://www.coindesk.com/arc/outboundfeeds/rss/"
+      weight: 1
+      enabled: true
+
+    - name: "Cointelegraph"
+      url: "https://cointelegraph.com/rss"
+      weight: 1
+      enabled: true
+
+    - name: "The Block"
+      url: "https://www.theblock.co/rss.xml"
+      weight: 1
+      enabled: true
+
+    - name: "Decrypt"
+      url: "https://decrypt.co/feed"
+      weight: 1
+      enabled: true
+
+    - name: "Blockworks"
+      url: "https://blockworks.co/feed"
+      weight: 1
+      enabled: true
+
+  # -------------------------------------------------------------------------
+  # 二、特朗普动态。这是你最关心的那类消息。
+  # 说明: Truth Social 官方接口已被 Cloudflare 封禁, 只能用第三方镜像
+  # trumpstruth.org, 通常比原帖慢 30 分钟到 3 小时。这是免费方案的上限。
+  # -------------------------------------------------------------------------
+  trump:
+    enabled: true
+    url: "https://www.trumpstruth.org/feed"
+    # 权重给 6。他发的帖子必须再提到伊朗/中国/关税这类实质话题才够门槛,
+    # 光是"特朗普说了句话"不会推送(否则他每天几十条动态会把你淹了)。
+    weight: 6
+
+  # -------------------------------------------------------------------------
+  # 三、币安公告。只监控"新币上线"和"下架"两个栏目, 这两类公告发布即生效,
+  # 几分钟内就会拉升或砸盘, 时效性最强。
+  # catalog_ids: 48 = 新币上线, 161 = 下架。不要随便加, 加了会变吵。
+  # -------------------------------------------------------------------------
+  binance_announcements:
+    enabled: true
+    # 注意: pageSize 最大只能填 20, 填 30 接口会返回 400
+    url: "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20"
+    catalog_ids: [48, 161]
+    # 公告标题里命中这些词就丢掉。这些是例行公告, 会命中"will launch/will list"
+    # 这类决定性短语, 但其实没人在意。
+    exclude_titles:
+      - "quarterly"
+      - "delivery contract"
+      - "tradfi"
+      - "tick size"
+      - "leverage"
+      - "margin"
+      - "loan"
+      - "binance convert"
+      - "binance earn"
+    weight: 6
+
+  # -------------------------------------------------------------------------
+  # 四、宏观数据日历。高影响数据(CPI/FOMC/非农)公布前提前预警。
+  # 这个接口限流很严, 所以代码里有重试 + 24 小时缓存, 不要改成频繁请求。
+  # -------------------------------------------------------------------------
+  macro_calendar:
+    enabled: true
+    url: "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    # JSON 被限流时改用这个 XML 备用接口(它的时间字段是 UTC, 代码里已处理)
+    fallback_url: "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+    # 抓成功一次后缓存多少小时不再重复抓
+    cache_hours: 24
+    # 提前多少分钟预警
+    lead_minutes: 20
+    # 只关心哪些国家的数据。USD = 美国
+    countries: ["USD"]
+    # 只关心什么级别。High / Medium / Low
+    impacts: ["High"]
+    weight: 8
+    pre_score: 15
+
+  # -------------------------------------------------------------------------
+  # 五、价格异动。比特币自己剧烈波动时, 它本身就是最重要的"消息"。
+  # -------------------------------------------------------------------------
+  price:
+    enabled: true
+    symbol: "BTCUSDT"
+    # 15 分钟内涨跌超过这个百分比就报警
+    move_15m_pct: 2.5
+    # 1 小时内涨跌超过这个百分比就报警
+    move_1h_pct: 5.0
+    # 同一个方向两次报警之间至少间隔多少分钟(防止一波行情反复轰炸)
+    cooldown_minutes: 45
+    weight: 10
+    force_score: 20
+
+  # -------------------------------------------------------------------------
+  # 六、链上巨鲸。这是全雷达噪音最大的一个源, 建议先用默认值观察几天。
+  # 觉得吵就把 enabled 改成 false。
+  # -------------------------------------------------------------------------
+  whales:
+    enabled: true
+    # 只看单笔超过多少 BTC 的转账
+    min_btc: 300
+    # 每天最多推几条
+    max_per_day: 2
+    # 一次最多打包几条
+    max_per_push: 2
+    weight: 3
+    force_score: 14
+
+
+# ===========================================================================
+# 打分规则 —— 决定什么算"重大"
+# ===========================================================================
+scoring:
+  # 【最重要的旋钮】达到这个分数才会推送。
+  # 嫌吵就调高到 14、16; 嫌漏就调低到 10、8。
+  threshold: 12
+
+  # 超过多少小时的消息不再推送(防止首次运行把历史消息全推一遍)
+  max_age_hours: 12
+
+  # ---- 硬信号闸门(强烈建议保持 true)----
+  # 开启后, 一条消息必须真的包含"发生了什么事"的词(宣战/空袭/制裁/下架/
+  # 破产/被盗/降息...), 光是"提到了伊朗"或"提到了比特币"这种背景性提及
+  # 一律不推。这是防止新闻刷屏最关键的一个开关。
+  require_hard_signal: true
+
+  # ---------------------------------------------------------------------------
+  # 第一档: 决定性短语 —— 每个 +10 分(最多算 2 个)
+  # 这些几乎不会误报, 出现基本就是大事。宁可在这里多写几条。
+  # 以 * 结尾表示前缀匹配, delist* 能命中 delist / delisted / delisting
+  # ---------------------------------------------------------------------------
+  decisive:
+    - "declares war"
+    - "war breaks out"
+    - "invades"
+    - "invaded"
+    - "invasion"
+    - "air strike*"
+    - "airstrike*"
+    - "missile strike*"
+    - "nuclear test*"
+    - "ceasefire*"
+    - "truce*"
+    - "tears up"
+    - "rips up"
+    - "scraps the"
+    - "withdraws from"
+    - "walks away from"
+    - "peace deal*"
+    - "sanctions on"
+    - "imposes sanctions"
+    - "slaps sanctions"
+    - "new sanctions"
+    - "embargo*"
+    - "tariffs on"
+    - "imposes tariffs"
+    - "tariff hike*"
+    - "new tariffs"
+    - "trade war*"
+    - "emergency meeting*"
+    - "state of emergency"
+    - "cuts interest rates"
+    - "hikes interest rates"
+    - "raises interest rates"
+    - "sovereign default"
+    - "defaults on"
+    - "bankrupt*"
+    - "insolven*"
+    - "martial law"
+    - "coup"
+    - "pauses withdrawals"
+    - "halts withdrawals"
+    - "suspends withdrawals"
+    - "exchange halts"
+    - "will list"
+    - "will delist"
+    - "delist*"
+    - "will launch"
+    - "etf approved"
+    - "sec approves"
+    - "sec sues"
+    - "hacked"
+    - "hackers steal"
+    - "ransomware"
+    - "drained"
+    - "stolen funds"
+    # 中文
+    - "停火"
+    - "撕毁"
+    - "宣战"
+    - "入侵"
+    - "空袭"
+    - "导弹"
+    - "制裁"
+    - "关税"
+    - "破产"
+    - "黑客"
+    - "被盗"
+    - "下架"
+    - "上币"
+    - "降息"
+    - "加息"
+
+  # ---------------------------------------------------------------------------
+  # 第二档: 事件词 —— 每个 +6 分(最多算 2 个)
+  # 单独出现还不够, 必须同时提到相关国家/机构/币种(下面的 topic 或 crypto)
+  # 才算"硬信号"。像 war / attack / blast 这种泛词已经被故意剔除了,
+  # 因为它们在世界新闻里到处都是, 会造成大量误报。
+  # ---------------------------------------------------------------------------
+  critical:
+    - "missile"
+    - "drone"
+    - "nuclear"
+    - "sanction*"
+    - "tariff*"
+    - "rate cut*"
+    - "rate hike*"
+    - "emergency rate*"
+    - "retaliat*"
+    - "blockade"
+    - "escalat*"
+    - "seizes"
+    - "seized"
+    - "frozen assets"
+    - "hack*"
+    - "exploit"
+    - "halt*"
+    - "suspend*"
+    - "shutdown"
+    - "banned"
+    - "blacklist*"
+    - "indict*"
+    - "sued"
+    - "sues"
+    - "lawsuit"
+    - "arrest*"
+    - "resign*"
+    - "approv*"
+    - "rejected"
+    - "listing"
+    - "plunge*"
+    - "crash*"
+    - "surge*"
+    - "soar*"
+    - "slump*"
+    - "tumbl*"
+    - "plummet*"
+    - "liquidat*"
+    - "sell-off"
+    - "selloff"
+    - "short squeeze"
+    - "record high"
+    - "all-time high"
+    # 中文
+    - "熔断"
+    - "暂停"
+    - "禁止"
+    - "冻结"
+    - "逮捕"
+    - "起诉"
+    - "监管"
+    - "暴涨"
+    - "暴跌"
+
+  # 地缘/宏观关键词: 每个 +5 分(最多算 3 个)
+  topic:
+    - "trump"
+    - "white house"
+    - "federal reserve"
+    - "fed"
+    - "powell"
+    - "fomc"
+    - "inflation"
+    - "cpi"
+    - "ppi"
+    - "nonfarm"
+    - "payrolls"
+    - "jobs report"
+    - "unemployment"
+    - "gdp"
+    - "interest rate"
+    - "rate cut"
+    - "rate hike"
+    - "treasury"
+    - "yield"
+    - "dollar index"
+    - "recession"
+    - "default"
+    - "iran"
+    - "tehran"
+    - "israel"
+    - "tel aviv"
+    - "gaza"
+    - "hamas"
+    - "hezbollah"
+    - "russia"
+    - "ukraine"
+    - "putin"
+    - "zelensky"
+    - "china"
+    - "taiwan"
+    - "north korea"
+    - "nato"
+    - "opec"
+    - "saudi"
+    - "oil price"
+    - "gold"
+    - "treasury secretary"
+    # 中文
+    - "特朗普"
+    - "白宫"
+    - "美联储"
+    - "鲍威尔"
+    - "通胀"
+    - "非农"
+    - "利率"
+    - "伊朗"
+    - "以色列"
+    - "俄罗斯"
+    - "乌克兰"
+    - "普京"
+    - "中国"
+    - "台湾"
+    - "朝鲜"
+    - "北约"
+    - "沙特"
+    - "石油"
+    - "黄金"
+    - "衰退"
+
+  # 币圈关键词: 每个 +4 分(最多算 2 个)
+  crypto:
+    - "bitcoin"
+    - "btc"
+    - "satoshi"
+    - "crypto"
+    - "cryptocurrency"
+    - "ethereum"
+    - "eth"
+    - "altcoin"
+    - "stablecoin"
+    - "tether"
+    - "usdt"
+    - "usdc"
+    - "binance"
+    - "coinbase"
+    - "okx"
+    - "bybit"
+    - "exchange"
+    - "etf"
+    - "blockchain"
+    - "token"
+    - "halving"
+    - "mining"
+    - "sec"
+    # 中文
+    - "比特币"
+    - "加密货币"
+    - "交易所"
+    - "稳定币"
+    - "代币"
+    - "矿工"
+
+  # 命中这些词的条目直接丢弃(不看分数)
+  # 这些是"看着吓人其实不影响价格"的日常公告
+  exclude:
+    - "maintenance"
+    - "network upgrade"
+    - "system upgrade"
+    - "wallet upgrade"
+    - "deposit and withdrawal"
+    - "monitoring tag"
+    - "price prediction"
+    - "technical analysis"
+    - "how to buy"
+    - "weekly recap"
+    - "newsletter"
+    - "sponsored"
+    - "press release"
+    - "维护"
+    - "系统升级"
+    - "钱包升级"
+
+
+# ===========================================================================
+# LLM 二次过滤(可选, 默认关闭)
+# ---------------------------------------------------------------------------
+# 开启后, 分数刚好卡在门槛附近的条目会交给 Claude 判断"是否真的值得打扰你",
+# 能明显减少噪音。需要:
+#   1. 把下面的 enabled 改成 true
+#   2. 在 GitHub 仓库的 Secrets 里加一个 ANTHROPIC_API_KEY
+#   3. 确认 model 名字在你的账号下可用(API 计费, 大约每天几分钱)
+# 不开也完全能用, 只是关键词过滤会稍微粗一点。
+# ===========================================================================
+llm_filter:
+  enabled: false
+  model: "claude-3-5-haiku-latest"
+  # 分数落在 [threshold - borderline_band, threshold + borderline_band] 区间内才调用
+  borderline_band: 6
