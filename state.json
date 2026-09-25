@@ -4330,5 +4330,86 @@
   "date": "2026-09-25",
   "n": 5
  },
- "last_push": "2026-09-25T15:13:48.431834+00:00"
+ "last_push": "2026-09-25T15:13:48.431834+00:00",
+ "cache": {
+  "etf_flows": {
+   "ts": "2026-09-25T15:56:30.042097+00:00",
+   "data": [
+    {
+     "date": "2026-09-24",
+     "totalNetInflow": 190646110.255,
+     "totalValueTraded": 2266336139.4,
+     "totalNetAssets": 108915022342.80003,
+     "cumNetInflow": 57412257640.037994
+    },
+    {
+     "date": "2026-09-23",
+     "totalNetInflow": 346977216.16999996,
+     "totalValueTraded": 3058052640.8,
+     "totalNetAssets": 108663294328.42632,
+     "cumNetInflow": 57221611529.783
+    },
+    {
+     "date": "2026-09-22",
+     "totalNetInflow": 714748985.505,
+     "totalValueTraded": 2822847326.6,
+     "totalNetAssets": 110839570707.00192,
+     "cumNetInflow": 56874634313.613
+    },
+    {
+     "date": "2026-09-21",
+     "totalNetInflow": 998952286.985,
+     "totalValueTraded": 4572053762.5,
+     "totalNetAssets": 110135172798.21364,
+     "cumNetInflow": 56159885328.108
+    },
+    {
+     "date": "2026-09-18",
+     "totalNetInflow": 433027402.35,
+     "totalValueTraded": 4666577652,
+     "totalNetAssets": 102531745269.31593,
+     "cumNetInflow": 55160933041.123
+    },
+    {
+     "date": "2026-09-17",
+     "totalNetInflow": 159453723.25,
+     "totalValueTraded": 1660401942.7,
+     "totalNetAssets": 96247076017.18536,
+     "cumNetInflow": 54727905638.772995
+    },
+    {
+     "date": "2026-09-16",
+     "totalNetInflow": -295980763.08,
+     "totalValueTraded": 2805896130.4,
+     "totalNetAssets": 95185081971.85114,
+     "cumNetInflow": 54568451915.522995
+    },
+    {
+     "date": "2026-09-15",
+     "totalNetInflow": -450329418.71,
+     "totalValueTraded": 4346558494.4,
+     "totalNetAssets": 95716988283.246,
+     "cumNetInflow": 54864432678.603
+    },
+    {
+     "date": "2026-09-14",
+     "totalNetInflow": 160042713.815,
+     "totalValueTraded": 2691001751.5,
+     "totalNetAssets": 100091702141.07127,
+     "cumNetInflow": 55314762097.312996
+    },
+    {
+     "date": "2026-09-11",
+     "totalNetInflow": -13289298.11,
+     "totalValueTraded": 2598656806.3,
+     "totalNetAssets": 97576805199.51761,
+     "cumNetInflow": 55154719383.498
+    }
+   ]
+  },
+  "btc_dominance": {
+   "ts": "2026-09-25T15:56:30.433528+00:00",
+   "data": 58.24
+  }
+ }
 }
