@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -87,32 +88,47 @@ def strip_html(raw: str) -> str:
     if not raw:
         return ""
     text = re.sub(r"<[^>]+>", " ", raw)
-    for src, dst in (
-        ("&nbsp;", " "), ("&amp;", "&"), ("&quot;", '"'),
-        ("&#39;", "'"), ("&apos;", "'"), ("&lt;", "<"), ("&gt;", ">"),
-        ("&#8217;", "'"), ("&#8220;", '"'), ("&#8221;", '"'),
-    ):
-        text = text.replace(src, dst)
+    # html.unescape 能处理全部实体, 包括 &#039; 这种带前导零的数字实体
+    # (手写替换表很容易漏, 之前就漏过 &#039; 导致推送里出现 "Russia&#039;s")
+    text = html.unescape(text).replace("\xa0", " ")
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _normalize_fraction(raw: str) -> str:
+    """
+    把小数秒补齐成 6 位。
+
+    为什么需要: 路透社的时间戳长这样 "2026-09-25T11:03:44.62Z", 只有 2 位小数。
+    Python 3.10 的 datetime.fromisoformat 只接受 3 位或 6 位小数秒, 会直接抛异常,
+    导致所有路透社消息的发布时间变成"时间未知"(3.11 之后才放宽)。补齐即可。
+    """
+    return re.sub(r"\.(\d+)(?=[Z+\-]|$)",
+                  lambda m: "." + (m.group(1) + "000000")[:6], raw, count=1)
+
+
 def parse_date(raw: str):
-    """兼容 RFC822(RSS) 和 ISO8601(Atom/JSON) 两种时间格式。"""
+    """兼容 RFC822(RSS)、ISO8601(Atom/JSON)、以及各种小数秒位数。"""
     raw = (raw or "").strip()
     if not raw:
         return None
+
+    # 先试 RSS 的时间格式
     try:
         dt = parsedate_to_datetime(raw)
         if dt is not None:
             return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     except Exception:
         pass
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        # 必须保证返回的是"带时区"的时间, 否则后面做减法会直接崩
-        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-    except Exception:
-        return None
+
+    # 再试 ISO8601: 原样和补齐小数秒两种都试一遍
+    for candidate in (raw, _normalize_fraction(raw)):
+        try:
+            dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            # 必须保证返回"带时区"的时间, 否则后面做减法会直接崩
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+        except Exception:
+            continue
+    return None
 
 
 def fmt_time(dt) -> str:
@@ -609,6 +625,227 @@ def fetch_whales(cfg: dict, state: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# 市场情绪数据
+# --------------------------------------------------------------------------
+# 收集一组"客观指标", 用来回答"现在市场是冷是热、多头还是空头拥挤"。
+# 每个指标独立抓取, 任何一个失败都不影响其他的。
+# 这些数字本身不是买卖建议, 是判断材料。
+# --------------------------------------------------------------------------
+
+CN_FNG = {
+    "Extreme Fear": "极度恐惧", "Fear": "恐惧", "Neutral": "中性",
+    "Greed": "贪婪", "Extreme Greed": "极度贪婪",
+}
+
+
+def _cached_fetch(state: dict, key: str, ttl_hours: float, fn):
+    """
+    带缓存的抓取。用于更新很慢(ETF 资金流一天才一次)、
+    或者容易被限流(CoinGecko)的接口。
+    抓取失败时回退到过期缓存, 有总比没有好。
+    """
+    cache = state.setdefault("cache", {})
+    entry = cache.get(key) or {}
+    if entry.get("data") is not None and entry.get("ts"):
+        try:
+            age = (datetime.now(UTC)
+                   - datetime.fromisoformat(entry["ts"])).total_seconds() / 3600
+            if age < ttl_hours:
+                return entry["data"]
+        except Exception:
+            pass
+    try:
+        data = fn()
+    except Exception:
+        data = None
+    if data is not None:
+        cache[key] = {"ts": datetime.now(UTC).isoformat(), "data": data}
+        return data
+    return entry.get("data")
+
+
+def collect_sentiment(cfg: dict, state: dict) -> dict:
+    """抓取一整套市场情绪指标。返回一个扁平 dict, 失败项就是缺字段。"""
+    conf = cfg.get("sentiment", {})
+    if not conf.get("enabled", True):
+        return {}
+
+    sym = conf.get("symbol", "BTCUSDT")
+    s: dict = {"symbol": sym}
+
+    # --- 恐惧贪婪指数(0-100)---
+    try:
+        data = get_json("https://api.alternative.me/fng/?limit=30", timeout=15)
+        rows = data.get("data") or []
+        if rows:
+            s["fng"] = int(rows[0]["value"])
+            s["fng_label"] = CN_FNG.get(rows[0].get("value_classification", ""),
+                                        rows[0].get("value_classification", ""))
+            recent = [int(r["value"]) for r in rows[:7]]
+            s["fng_7d_avg"] = round(sum(recent) / len(recent), 1)
+            s["fng_30d_min"] = min(int(r["value"]) for r in rows)
+            s["fng_30d_max"] = max(int(r["value"]) for r in rows)
+    except Exception as exc:
+        log(f"  [!] 恐惧贪婪指数失败: {type(exc).__name__}")
+
+    # --- 资金费率(当前值 + 一周均值, 判断多头是否拥挤)---
+    try:
+        prem = get_json(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}",
+                        timeout=12)
+        s["funding"] = round(float(prem.get("lastFundingRate") or 0) * 100, 4)
+        hist = get_json(f"https://fapi.binance.com/fapi/v1/fundingRate"
+                        f"?symbol={sym}&limit=21", timeout=12)
+        rates = [float(r["fundingRate"]) * 100 for r in hist]
+        if rates:
+            s["funding_7d_avg"] = round(sum(rates) / len(rates), 4)
+            s["funding_7d_max"] = round(max(rates), 4)
+            s["funding_7d_min"] = round(min(rates), 4)
+    except Exception as exc:
+        log(f"  [!] 资金费率失败: {type(exc).__name__}")
+
+    # --- 多空持仓比(>1 表示账户层面多头多)---
+    try:
+        ls = get_json("https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+                      f"?symbol={sym}&period=1d&limit=7", timeout=12)
+        if ls:
+            s["long_short"] = round(float(ls[0]["longShortRatio"]), 3)
+            ratios = [float(x["longShortRatio"]) for x in ls]
+            s["long_short_7d_max"] = round(max(ratios), 3)
+            s["long_short_7d_avg"] = round(sum(ratios) / len(ratios), 3)
+    except Exception as exc:
+        log(f"  [!] 多空比失败: {type(exc).__name__}")
+
+    # --- 主动买卖量比(>1 表示主动买盘更强)---
+    try:
+        tk = get_json("https://fapi.binance.com/futures/data/takerlongshortRatio"
+                      f"?symbol={sym}&period=1d&limit=2", timeout=12)
+        if tk:
+            s["taker_ratio"] = round(float(tk[0]["buySellRatio"]), 3)
+    except Exception as exc:
+        log(f"  [!] 主动买卖比失败: {type(exc).__name__}")
+
+    # --- 未平仓合约量 24 小时变化(配合价格看是加仓还是平仓)---
+    try:
+        oi = get_json("https://fapi.binance.com/futures/data/openInterestHist"
+                      f"?symbol={sym}&period=1d&limit=2", timeout=12)
+        if len(oi) >= 2:
+            now_oi = float(oi[0]["sumOpenInterestValue"])
+            prev_oi = float(oi[1]["sumOpenInterestValue"])
+            s["oi_usd"] = now_oi
+            if prev_oi:
+                s["oi_change_24h"] = round((now_oi - prev_oi) / prev_oi * 100, 2)
+    except Exception as exc:
+        log(f"  [!] 未平仓量失败: {type(exc).__name__}")
+
+    # --- 美国现货比特币 ETF 资金流(近几个交易日, 单位美元)---
+    def _etf():
+        resp = requests.post(
+            "https://api.sosovalue.xyz/openapi/v2/etf/historicalInflowChart",
+            headers={**HEADERS, "Content-Type": "application/json"},
+            json={"type": conf.get("etf_type", "us-btc-spot")}, timeout=20)
+        resp.raise_for_status()
+        return (resp.json().get("data") or [])[:10]
+
+    rows = _cached_fetch(state, "etf_flows", conf.get("etf_cache_hours", 6), _etf)
+    if rows:
+        flows = [float(r.get("totalNetInflow") or 0) for r in rows]
+        s["etf_recent"] = flows[:5]
+        s["etf_1d"] = flows[0] if flows else None
+        s["etf_3d"] = sum(flows[:3])
+        s["etf_5d"] = sum(flows[:5])
+        s["etf_days"] = len(flows)
+
+    # --- 现货行情 ---
+    try:
+        tk24 = get_json(f"https://api.binance.com/api/v3/ticker/24hr?symbol={sym}",
+                        timeout=12)
+        s["price"] = float(tk24["lastPrice"])
+        s["change_24h"] = round(float(tk24["priceChangePercent"]), 2)
+        s["volume_24h_usd"] = float(tk24["quoteVolume"])
+        kl = get_json(f"https://api.binance.com/api/v3/klines?symbol={sym}"
+                      f"&interval=1d&limit=8", timeout=12)
+        if len(kl) >= 8:
+            first, last = float(kl[0][4]), float(kl[-1][4])
+            if first:
+                s["change_7d"] = round((last / first - 1) * 100, 2)
+    except Exception as exc:
+        log(f"  [!] 行情失败: {type(exc).__name__}")
+
+    # --- 比特币市占率 ---
+    def _dom():
+        g = get_json("https://api.coingecko.com/api/v3/global", timeout=15)
+        return round(float(g["data"]["market_cap_percentage"]["btc"]), 2)
+
+    dom = _cached_fetch(state, "btc_dominance", 6, _dom)
+    if dom:
+        s["btc_dominance"] = dom
+
+    got = [k for k in ("fng", "funding", "long_short", "oi_change_24h",
+                       "etf_3d", "price") if s.get(k) is not None]
+    log(f"  · 市场情绪: 取到 {len(got)}/6 项核心指标 ({', '.join(got)})")
+    return s
+
+
+def sentiment_summary_line(s: dict) -> str:
+    """把情绪数据压成一行, 放在推送顶部给用户一眼看完。"""
+    if not s:
+        return ""
+    parts = []
+    if s.get("fng") is not None:
+        parts.append(f"恐惧贪婪 {s['fng']}({s.get('fng_label','')})")
+    if s.get("funding") is not None:
+        parts.append(f"资金费率 {s['funding']:+.4f}%")
+    if s.get("long_short") is not None:
+        parts.append(f"多空比 {s['long_short']:.2f}")
+    if s.get("oi_change_24h") is not None:
+        parts.append(f"未平仓 24h {s['oi_change_24h']:+.1f}%")
+    if s.get("etf_3d") is not None:
+        parts.append(f"ETF 近3日 {s['etf_3d'] / 1e8:+.2f} 亿美元")
+    if s.get("price") is not None:
+        parts.append(f"BTC ${s['price']:,.0f}")
+    if s.get("change_24h") is not None and s.get("change_7d") is not None:
+        parts.append(f"({s['change_24h']:+.1f}%/24h, {s['change_7d']:+.1f}%/7d)")
+    return " · ".join(parts)
+
+
+def sentiment_facts(s: dict) -> str:
+    """给 AI 看的详细版指标清单。"""
+    if not s:
+        return "(本轮的行情指标抓取失败, 没有可用数据)"
+    lines = []
+    if s.get("price") is not None:
+        lines.append(f"- BTC 价格: ${s['price']:,.0f}"
+                     f" (24小时 {s.get('change_24h', 0):+.2f}%, "
+                     f"7天 {s.get('change_7d', 0):+.2f}%)")
+    if s.get("fng") is not None:
+        lines.append(f"- 恐惧贪婪指数: {s['fng']}/100 ({s.get('fng_label','')}), "
+                     f"近7日均值 {s.get('fng_7d_avg','?')}, "
+                     f"近30日区间 {s.get('fng_30d_min','?')}-{s.get('fng_30d_max','?')}")
+    if s.get("funding") is not None:
+        lines.append(f"- 合约资金费率(8小时): {s['funding']:+.4f}%, "
+                     f"近7日均值 {s.get('funding_7d_avg','?')}%, "
+                     f"近7日区间 {s.get('funding_7d_min','?')}% ~ {s.get('funding_7d_max','?')}%"
+                     " (正值=多头付费, 越高说明多头越拥挤)")
+    if s.get("long_short") is not None:
+        lines.append(f"- 多空账户比: {s['long_short']:.2f}, "
+                     f"近7日均值 {s.get('long_short_7d_avg','?')}, "
+                     f"近7日最高 {s.get('long_short_7d_max','?')} (>1 表示多数账户持多)")
+    if s.get("taker_ratio") is not None:
+        lines.append(f"- 主动买卖量比: {s['taker_ratio']:.2f} (>1 表示主动买盘更强)")
+    if s.get("oi_change_24h") is not None:
+        lines.append(f"- 未平仓合约量: 24小时 {s['oi_change_24h']:+.2f}%, "
+                     f"当前名义价值 ${s.get('oi_usd', 0) / 1e9:.2f}B")
+    if s.get("etf_3d") is not None:
+        daily = ", ".join(f"{v / 1e6:+.0f}M" for v in s.get("etf_recent", []))
+        lines.append(f"- 美国现货比特币ETF净流入: 近几日(新→旧) {daily} 美元; "
+                     f"近3日累计 {s['etf_3d'] / 1e8:+.2f}亿美元, "
+                     f"近5日累计 {s.get('etf_5d', 0) / 1e8:+.2f}亿美元")
+    if s.get("btc_dominance") is not None:
+        lines.append(f"- 比特币市占率: {s['btc_dominance']:.1f}%")
+    return "\n".join(lines) if lines else "(本轮指标抓取全部失败)"
+
+
+# --------------------------------------------------------------------------
 # 打分与过滤
 # --------------------------------------------------------------------------
 
@@ -744,21 +981,70 @@ def filter_items(items: list[dict], cfg: dict) -> tuple[list[dict], list[dict]]:
 # 推送
 # --------------------------------------------------------------------------
 
-def build_message(items: list[dict], cfg: dict, sent_today: int) -> tuple[str, str]:
-    """生成 PushPlus 的标题和正文(markdown)。"""
-    top = items[0]
-    if len(items) == 1:
-        title = f"【雷达】{top['source']}: {top['title'][:60]}"
-    else:
-        title = f"【雷达】{len(items)}条: {top['title'][:50]}"
+def build_message(items: list[dict], cfg: dict, sent_today: int,
+                  sentiment: dict | None = None,
+                  lean: dict | None = None) -> tuple[str, str]:
+    """
+    生成 PushPlus 的标题和正文(markdown)。
 
-    lines = [f"## 情报雷达 · {len(items)} 条", ""]
+    正文分三段:
+      1. 市场情绪 —— 客观指标, 一眼看清现在的市场温度
+      2. 多空倾向 —— AI 从上面这些指标推导出的短期/中期结论(附理由)
+      3. 情报    —— 每条消息带利好利空判断和传导逻辑
+    """
+    top = items[0]
+    lean = lean or {}
+    short_lean = (lean.get("short_term") or {}).get("lean", "")
+    top_direction = (top.get("ai") or {}).get("direction", "")
+
+    # 标题在微信里一定会显示, 所以把最重要的信息塞进去
+    if len(items) == 1:
+        prefix = f"{top_direction} · " if top_direction in ("利好", "利空") else ""
+        title = f"【雷达】{prefix}{top['title'][:56]}"
+    elif short_lean:
+        title = f"【雷达】短期{short_lean} · {len(items)}条情报"
+    else:
+        title = f"【雷达】{len(items)}条情报"
+
+    lines: list[str] = []
+
+    # ---- 1. 市场情绪 ----
+    summary = sentiment_summary_line(sentiment or {})
+    if summary:
+        lines += ["## 市场情绪", summary, ""]
+
+    # ---- 2. 多空倾向 ----
+    st, mt = lean.get("short_term") or {}, lean.get("mid_term") or {}
+    if st.get("lean") or mt.get("lean"):
+        if st.get("lean"):
+            lines.append(f"**短期(1-7天): {st['lean']}** — {st.get('reason', '')}")
+        if mt.get("lean"):
+            lines.append(f"**中期(1-3个月): {mt['lean']}** — {mt.get('reason', '')}")
+        if lean.get("conflict"):
+            lines.append(f"矛盾信号: {lean['conflict']}")
+        lines.append("")
+
+    # ---- 3. 情报 ----
+    lines += [f"## 情报 · {len(items)} 条", ""]
     for idx, item in enumerate(items, 1):
         lines.append(f"**{idx}. [{item['source']}] {item['title']}**")
+
+        ai = item.get("ai") or {}
+        if ai.get("direction"):
+            bits = [f"**{ai['direction']}**"]
+            if ai.get("confidence"):
+                bits.append(f"置信度{ai['confidence']}")
+            if ai.get("horizon"):
+                bits.append(f"影响{ai['horizon']}")
+            lines.append(" · ".join(bits))
+        if ai.get("reason"):
+            lines.append(ai["reason"])
+
         if item.get("detail"):
             lines.append(item["detail"])
         elif item.get("summary"):
-            lines.append(item["summary"][:200])
+            lines.append(item["summary"][:180])
+
         meta = f"{fmt_time(item.get('ts'))} · 评分 {item['score']}"
         if item.get("reasons"):
             meta += " · " + ", ".join(item["reasons"])
@@ -768,8 +1054,10 @@ def build_message(items: list[dict], cfg: dict, sent_today: int) -> tuple[str, s
         lines.append("")
 
     cap = int(cfg["push"].get("max_pushes_per_day", 15))
+    disclaimer = cfg["push"].get("disclaimer", "信息整理,非投资建议")
     lines.append("---")
-    lines.append(f"今日已推 {sent_today + 1}/{cap} 条 · 阈值 {cfg['scoring']['threshold']}")
+    lines.append(f"{disclaimer} · 今日已推 {sent_today + 1}/{cap} 条 · "
+                 f"阈值 {cfg['scoring']['threshold']}")
     return title, "\n".join(lines)
 
 
@@ -815,86 +1103,235 @@ def send_push(title: str, content: str, cfg: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
-# 可选的 LLM 二次过滤
+# AI 分析层(利好利空判断 + 市场多空倾向)
+# --------------------------------------------------------------------------
+# 说明: 这一层只做两件事 ——
+#   1. 判断每条消息对比特币是利好还是利空, 并说清传导机制
+#   2. 把上一步收集的客观指标汇总成短期/中期倾向
+# 它不预测价格, 也不给买卖点位。所有结论都必须能追溯到列出的理由。
+#
+# 重要: AI 挂掉时不会影响推送 —— 消息照常发, 只是少一段分析。
 # --------------------------------------------------------------------------
 
-def llm_should_push(item: dict, cfg: dict) -> tuple[bool | None, str]:
-    """
-    对"擦边"的条目调用 Claude 判断是否真的值得打扰用户。
-    返回 (判断结果, 理由); 返回 None 表示不可用/出错, 此时沿用关键词判断。
+AI_BASE = "https://api.anthropic.com/v1/messages"
+AI_MODELS_URL = "https://api.anthropic.com/v1/models"
 
-    只有在 config.yaml 里把 llm_filter.enabled 设为 true
-    并且设置了 ANTHROPIC_API_KEY 环境变量时才会生效。
-    """
-    conf = cfg.get("llm_filter", {})
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not conf.get("enabled") or not api_key:
-        return None, ""
 
-    prompt = (
-        "你是一个加密货币交易员的情报过滤助手。判断下面这条消息是否达到"
-        "\"值得立刻推送手机提醒\"的程度。\n\n"
-        "推送标准: 消息若属实, 可能在未来数小时内引起比特币价格超过 2% 的波动。\n"
-        "不要推送: 常规行情分析、观点评论、价格预测、回顾性报道、广告、"
-        "与市场无关的社会新闻。\n\n"
-        f"标题: {item['title']}\n"
-        f"摘要: {item.get('summary','(无)')[:300]}\n"
-        f"来源: {item['source']}\n\n"
-        "只输出一个 JSON, 不要有任何其他文字:\n"
-        '{"push": true 或 false, "reason": "一句话中文理由"}'
-    )
+def ai_available(cfg: dict) -> bool:
+    return bool(cfg.get("ai", {}).get("enabled")
+                and os.environ.get("ANTHROPIC_API_KEY", "").strip())
+
+
+def _ai_headers() -> dict:
+    return {
+        "x-api-key": os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+
+def _extract_json(text: str, expect_list: bool = False):
+    """从模型回复里把 JSON 抠出来, 容忍 markdown 代码块包裹和前后废话。"""
+    if not text:
+        return None
+    body = re.sub(r"^```[a-zA-Z]*\s*", "", text.strip())
+    body = re.sub(r"\s*```$", "", body)
+    open_ch, close_ch = ("[", "]") if expect_list else ("{", "}")
+    start, end = body.find(open_ch), body.rfind(close_ch)
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(body[start:end + 1])
+    except Exception:
+        return None
+
+
+def resolve_model(cfg: dict, state: dict) -> str | None:
+    """
+    确定用哪个模型。模型名会随时间变化, 所以不写死:
+      1. 先问 Anthropic 的 /v1/models 接口"你现在有哪些模型"(免费, 不耗 token)
+         从中挑一个最便宜的可用档位(haiku > sonnet > opus)
+      2. 问不到就退回 config.yaml 里手写的候选列表
+      3. 结果缓存进 state.json, 之后不再重复探测
+    """
+    cached = state.get("ai_model")
+    if cached:
+        return cached
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": conf.get("model", "claude-3-5-haiku-latest"),
-                "max_tokens": 120,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=25,
-        )
-        resp.raise_for_status()
-        text = resp.json()["content"][0]["text"]
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            return None, ""
-        verdict = json.loads(match.group(0))
-        return bool(verdict.get("push")), str(verdict.get("reason", ""))[:80]
+        resp = requests.get(f"{AI_MODELS_URL}?limit=100",
+                            headers=_ai_headers(), timeout=20)
+        if resp.status_code == 200:
+            ids = [m.get("id", "") for m in (resp.json().get("data") or [])]
+            for tier in ("haiku", "sonnet", "opus"):
+                for mid in ids:
+                    if tier in mid.lower():
+                        log(f"  · AI 模型: {mid} (自动探测)")
+                        state["ai_model"] = mid
+                        return mid
+            log(f"  [!] 账号下没找到可用模型, 返回: {ids[:5]}")
     except Exception as exc:
-        log(f"  [!] LLM 过滤调用失败, 回退到关键词判断: {type(exc).__name__}")
-        return None, ""
+        log(f"  · 模型探测失败({type(exc).__name__}), 改用配置里的候选列表")
+
+    for mid in cfg.get("ai", {}).get("models", []):
+        log(f"  · AI 模型: {mid} (配置候选)")
+        state["ai_model"] = mid
+        return mid
+    return None
 
 
-def apply_llm_filter(items: list[dict], cfg: dict) -> list[dict]:
-    """只对分数处在阈值边缘的条目调用 LLM, 控制成本。"""
-    conf = cfg.get("llm_filter", {})
-    if not conf.get("enabled") or not os.environ.get("ANTHROPIC_API_KEY"):
+def _ai_raw(cfg: dict, state: dict, prompt: str, max_tokens: int) -> str | None:
+    """调一次 Claude。任何失败都返回 None(调用方负责降级)。"""
+    if not ai_available(cfg):
+        return None
+    model = resolve_model(cfg, state)
+    if not model:
+        return None
+
+    body = {"model": model, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}]}
+
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(AI_BASE, headers=_ai_headers(), json=body,
+                                 timeout=60)
+            if resp.status_code == 200:
+                return resp.json()["content"][0]["text"]
+
+            snippet = resp.text[:220]
+            log(f"  [!] AI 调用失败 {resp.status_code}: {snippet}")
+            # 模型名失效(改名/下线) → 清掉缓存重新探测一次再试
+            if resp.status_code in (400, 404) and "model" in snippet.lower():
+                state.pop("ai_model", None)
+                new_model = resolve_model(cfg, state)
+                if new_model and new_model != model:
+                    model = new_model
+                    body["model"] = model
+                    log(f"  · 换用模型重试: {model}")
+                    continue
+            return None
+        except Exception as exc:
+            log(f"  [!] AI 调用异常: {type(exc).__name__} {exc}")
+            if attempt == 1:
+                time.sleep(3)
+    return None
+
+
+ITEM_PROMPT = """你是加密货币交易员的情报分析助手。下面是 {n} 条可能影响比特币价格的新闻。
+
+{items}
+
+请对每一条判断两件事:
+
+1. «keep»: 这条值不值得立刻推送手机提醒?
+   判断标准: 如果消息属实, 是否可能在未来数小时内引起比特币价格超过 2% 的波动。
+   不值得推的典型: 常规行情综述、观点评论、价格预测、历史回顾、营销内容、
+   与市场无关的社会新闻、只提到某个国家但没有实质事件。
+   注意: 只有被标记为「擦边」的那几条需要你决定去留; 被标记为「高分」的请一律 keep=true。
+
+2. «direction»: 对比特币是「利好」「利空」「中性」还是「方向不明」。
+   «confidence»: 「高」「中」「低」。
+   «horizon»: 「短期」(数小时到数天)、「中期」(数周到数月) 还是「两者」。
+   «reason»: 一句话讲清传导机制 —— 为什么会这样影响价格。不超过 40 字。
+
+必须遵守:
+- 如果影响路径不清晰, 或者市场很可能已经提前计价, 就选「方向不明」并在理由里说明。
+  不要为了给出结论而强行判断。
+- 不要预测价格, 不要给买卖建议。
+- 严格输出 JSON 数组, 长度正好 {n}, 不要任何其他文字:
+[{{"keep":true,"direction":"利空","confidence":"高","horizon":"短期","reason":"..."}}]"""
+
+
+def ai_process_items(items: list[dict], cfg: dict, state: dict) -> list[dict]:
+    """
+    一次 API 调用同时完成"边缘条目去噪"和"利好利空标注"。
+    返回处理后的条目列表。AI 不可用时原样返回。
+    """
+    if not items or not ai_available(cfg):
         return items
 
     threshold = int(cfg["scoring"].get("threshold", 12))
-    borderline = int(conf.get("borderline_band", 6))
-    kept: list[dict] = []
+    band = int(cfg.get("ai", {}).get("borderline_band", 6))
 
-    for item in items:
-        if abs(item["score"] - threshold) > borderline:
-            kept.append(item)          # 分数很确定, 不浪费一次 API 调用
-            continue
-        verdict, reason = llm_should_push(item, cfg)
-        if verdict is None:
-            kept.append(item)          # 调用失败, 保守放行(沿用关键词结论)
-        elif verdict:
-            item["reasons"].append(f"AI:{reason}")
+    lines = []
+    for idx, item in enumerate(items, 1):
+        tag = "擦边" if abs(item["score"] - threshold) <= band else "高分"
+        lines.append(
+            f"[{idx}] ({tag}) 标题: {item['title']}\n"
+            f"    来源: {item['source']}\n"
+            f"    摘要: {item.get('summary', '')[:220] or '(无)'}"
+        )
+
+    prompt = ITEM_PROMPT.format(n=len(items), items="\n".join(lines))
+    text = _ai_raw(cfg, state, prompt, max_tokens=200 + 110 * len(items))
+    if not text:
+        log("  · AI 不可用, 本轮消息不带分析直接推送")
+        return items
+
+    verdicts = _extract_json(text, expect_list=True)
+    if not isinstance(verdicts, list):
+        log("  · AI 返回内容无法解析, 本轮消息不带分析直接推送")
+        return items
+
+    kept: list[dict] = []
+    for idx, item in enumerate(items):
+        verdict = verdicts[idx] if idx < len(verdicts) else {}
+        if not isinstance(verdict, dict):
             kept.append(item)
-        else:
-            item["drop_reason"] = f"AI 判定不推: {reason}"
-            log(f"  · AI 拦截: {item['title'][:50]} ({reason})")
+            continue
+
+        is_borderline = abs(item["score"] - threshold) <= band
+        if is_borderline and verdict.get("keep") is False:
+            log(f"  · AI 判定不值得推: {item['title'][:46]}")
+            continue
+
+        direction = str(verdict.get("direction", "")).strip()
+        if direction:
+            item["ai"] = {
+                "direction": direction,
+                "confidence": str(verdict.get("confidence", "")).strip(),
+                "horizon": str(verdict.get("horizon", "")).strip(),
+                "reason": str(verdict.get("reason", "")).strip()[:80],
+            }
+        kept.append(item)
     return kept
+
+
+SENTIMENT_PROMPT = """以下是比特币市场当前的客观指标, 数据来自交易所和公开指数。
+
+{facts}
+
+请据此输出一个 JSON 对象, 包含:
+
+- "short_term": {{"lean": "偏多"或"偏空"或"中性", "reason": "一句话理由(40字内)"}}
+  短期指 1-7 天。
+- "mid_term":   {{"lean": "偏多"或"偏空"或"中性", "reason": "一句话理由(40字内)"}}
+  中期指 1-3 个月。
+- "conflict": 如果上面的指标之间存在互相矛盾的信号, 用一句话点出来(说明哪两个指标打架、
+  意味着什么)。没有矛盾就填空字符串。
+
+必须遵守:
+- 结论必须能从上列指标推导出来, 不要引入外部假设或你对行情的记忆。
+- 指标信号不明确时宁可给「中性」。
+- 不要预测价格点位, 不要给买卖建议。
+- 只输出 JSON, 不要任何其他文字。"""
+
+
+def ai_interpret_sentiment(sent: dict, cfg: dict, state: dict) -> dict | None:
+    """把客观指标汇总成短期/中期多空倾向。失败返回 None。"""
+    if not ai_available(cfg) or not sent:
+        return None
+    prompt = SENTIMENT_PROMPT.format(facts=sentiment_facts(sent))
+    text = _ai_raw(cfg, state, prompt, max_tokens=700)
+    if not text:
+        return None
+    data = _extract_json(text, expect_list=False)
+    if not isinstance(data, dict):
+        log("  · AI 情绪解读返回无法解析")
+        return None
+    if not data.get("short_term") and not data.get("mid_term"):
+        return None
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -902,23 +1339,73 @@ def apply_llm_filter(items: list[dict], cfg: dict) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def run_test(cfg: dict) -> int:
-    """--test: 发一条测试消息, 验证 token 和推送链路。"""
+    """
+    --test: 完整自检。逐项检查推送链路、市场情绪接口、AI 分析,
+    结果同时打到日志和你的微信里, 哪一项挂了会直接写明原因。
+    """
     log("=" * 56)
-    log("测试模式: 发送一条测试推送到你的微信")
+    log("自检模式: 推送链路 / 市场情绪 / AI 分析")
     log("=" * 56)
-    now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-    title = "【雷达】测试推送成功"
-    content = (
-        "## 链路连通\n\n"
-        "如果你在微信里看到了这条消息, 说明 PushPlus 配置正确。\n\n"
-        f"- 令牌: 有效\n"
-        f"- 时间: {now}\n"
-        f"- 阈值: {cfg['scoring']['threshold']}\n\n"
-        "接下来把 GitHub Actions 的定时任务打开就行了。\n"
-        "如果只看到标题看不到正文, 请在 PushPlus 公众号里发送「激活消息」。"
-    )
-    ok = send_push(title, content, cfg)
-    log("测试结果:", "成功" if ok else "失败 —— 请看上面的错误提示")
+
+    state = load_state()
+    checks: list[tuple[str, bool, str]] = []
+
+    # ---- 1. 推送链路 ----
+    log("[1/3] 检查 PushPlus 令牌 ...")
+    has_token = bool(os.environ.get("PUSHPLUS_TOKEN", "").strip())
+    checks.append(("PushPlus 令牌", has_token,
+                   "已读到" if has_token else "没读到 PUSHPLUS_TOKEN 这个 Secret"))
+
+    # ---- 2. 市场情绪 ----
+    log("[2/3] 抓取市场情绪指标 ...")
+    sentiment = collect_sentiment(cfg, state)
+    core = [k for k in ("fng", "funding", "long_short", "etf_3d", "price")
+            if sentiment.get(k) is not None]
+    checks.append(("市场情绪接口", len(core) >= 3,
+                   f"{len(core)}/5 项可用" if core else "全部抓取失败"))
+
+    # ---- 3. AI ----
+    log("[3/3] 测试 AI 分析 ...")
+    lean = None
+    if not cfg.get("ai", {}).get("enabled"):
+        checks.append(("AI 分析", False, "config.yaml 里 ai.enabled 是 false"))
+    elif not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        checks.append(("AI 分析", False, "没读到 ANTHROPIC_API_KEY 这个 Secret"))
+    else:
+        lean = ai_interpret_sentiment(sentiment, cfg, state)
+        checks.append(("AI 分析", lean is not None,
+                       "正常" if lean else "调用失败, 原因见上面的日志"))
+
+    # 把探测到的模型名和接口缓存留下来, 正式跑的时候就不用再探测了
+    save_state(state)
+
+    lines = ["## 自检结果", ""]
+    for name, passed, note in checks:
+        lines.append(f"{'通过' if passed else '**失败**'} · {name} · {note}")
+    lines.append("")
+
+    if sentiment:
+        lines += ["### 实时指标", sentiment_summary_line(sentiment), ""]
+
+    if lean:
+        st, mt = lean.get("short_term") or {}, lean.get("mid_term") or {}
+        lines.append("### AI 解读")
+        if st.get("lean"):
+            lines.append(f"短期(1-7天): **{st['lean']}** — {st.get('reason','')}")
+        if mt.get("lean"):
+            lines.append(f"中期(1-3个月): **{mt['lean']}** — {mt.get('reason','')}")
+        if lean.get("conflict"):
+            lines.append(f"矛盾信号: {lean['conflict']}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("看到这条消息说明推送链路是通的。三项全通过就可以交给它自己跑了。")
+    lines.append("如果只看到标题看不到正文, 在 PushPlus 公众号里发送「激活消息」。")
+
+    ok_count = sum(1 for _, passed, _ in checks if passed)
+    title = f"【雷达】自检 {ok_count}/{len(checks)} 项通过"
+    ok = send_push(title, "\n".join(lines), cfg)
+    log(f"自检完成: {ok_count}/{len(checks)} 项通过 | 推送{'成功' if ok else '失败'}")
     return 0 if ok else 1
 
 
@@ -972,18 +1459,36 @@ def run_once(cfg: dict, dry_run: bool = False) -> int:
         log("基线已建立。下一条新消息就会正常推送。")
         return 0
 
-    # 可选的 AI 二次过滤
-    passed = apply_llm_filter(passed, cfg)
-
-    # 每日上限
+    # 每日上限(先判断, 省得白调一次 AI)
     sent_today = bump_daily_counter(state)
     cap = int(cfg["push"].get("max_pushes_per_day", 15))
     if sent_today >= cap:
         log(f"今日推送已达上限 {cap} 条, 本轮不再推送")
         passed = []
 
+    # AI 分析: 边缘条目去噪 + 利好利空标注(一次 API 调用同时完成这两件事)
+    passed = ai_process_items(passed, cfg, state)
+
     max_items = int(cfg["push"].get("max_items_per_push", 5))
     push_list = passed[:max_items]
+
+    # 只有真的要推送时, 才去抓市场情绪(省请求、省时间)
+    sentiment: dict = {}
+    lean: dict | None = None
+    if push_list:
+        # 情绪面板是"锦上添花", 绝不该因为它出问题就丢掉整条消息
+        try:
+            log("抓取市场情绪指标 ...")
+            sentiment = collect_sentiment(cfg, state)
+            if ai_available(cfg):
+                lean = ai_interpret_sentiment(sentiment, cfg, state)
+                if lean is None:
+                    log("  · 情绪解读不可用, 本次只展示原始指标")
+            else:
+                log("  · 未配置 AI, 只展示原始指标(配置 ANTHROPIC_API_KEY 可开启解读)")
+        except Exception as exc:
+            log(f"  [!] 情绪模块异常({type(exc).__name__}), 跳过情绪面板继续推送")
+            sentiment, lean = {}, None
 
     # 记录所有已见条目(包括没推的), 防止下轮重复评估
     now_iso = datetime.now(UTC).isoformat()
@@ -1001,7 +1506,7 @@ def run_once(cfg: dict, dry_run: bool = False) -> int:
                 set(state.get("macro_alerted", [])) | set(macro_keys))[-200:]
 
     if push_list:
-        title, content = build_message(push_list, cfg, sent_today)
+        title, content = build_message(push_list, cfg, sent_today, sentiment, lean)
         if dry_run:
             log("-" * 56)
             log("[dry-run] 本应推送:")
